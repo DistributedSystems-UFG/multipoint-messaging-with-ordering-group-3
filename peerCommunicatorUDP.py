@@ -1,4 +1,4 @@
-from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, socket
+from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, timeout as SocketTimeout, socket
 import os
 import pickle
 import random
@@ -10,10 +10,18 @@ from namingService import NamingServiceClient, compose_endpoint, detect_local_ip
 
 
 class MessageHandler(threading.Thread):
-    def __init__(self, recv_socket, myself, expected_handshakes, total_expected_messages):
+    def __init__(
+        self,
+        recv_socket,
+        myself,
+        expected_handshakes,
+        total_expected_messages,
+        server_endpoint,
+    ):
         threading.Thread.__init__(self)
         self.sock = recv_socket
         self.myself = myself
+        self.server_endpoint = server_endpoint
 
         self.expected_handshakes = expected_handshakes
         self.total_expected_messages = total_expected_messages
@@ -138,21 +146,76 @@ class MessageHandler(threading.Thread):
                 self.finished = True
                 break
 
+    def _buffer_ordered_message(self, msg):
+        seq = msg.get("seq")
+        if not isinstance(seq, int):
+            print("[Peer %s] Ignored message with invalid seq: %s" % (self.myself, msg))
+            return
+
+        if seq < self.next_expected_seq:
+            print("[Peer %s] Ignored duplicate seq=%s" % (self.myself, seq))
+            return
+
+        if seq not in self.buffer:
+            self.buffer[seq] = msg
+            print("[Peer %s] Buffered seq=%s (%s from peer %s)" % (
+                self.myself,
+                seq,
+                msg["kind"],
+                msg["from"],
+            ))
+
+    def _request_missing_sequence(self, seq):
+        server_host, server_port = self.server_endpoint
+        req = {"op": "resend", "seq": seq, "peer": self.myself}
+
+        try:
+            with socket(AF_INET, SOCK_STREAM) as sock:
+                sock.settimeout(1.0)
+                sock.connect((server_host, server_port))
+                sock.sendall(pickle.dumps(req))
+                sock.shutdown(1)
+                response = pickle.loads(self._read_all(sock))
+        except Exception as exc:
+            print("[Peer %s] Could not request seq=%s: %s" % (self.myself, seq, exc))
+            return
+
+        if isinstance(response, dict) and response.get("status") == "ok":
+            msg = response.get("message")
+            if isinstance(msg, dict) and msg.get("op") == "apply":
+                print("[Peer %s] Recovered missing seq=%s from sequencer" % (self.myself, seq))
+                self._buffer_ordered_message(msg)
+        elif isinstance(response, dict) and response.get("status") == "unavailable":
+            pass
+        else:
+            print("[Peer %s] Unexpected resend response for seq=%s: %s" % (self.myself, seq, response))
+
+    @staticmethod
+    def _read_all(sock):
+        chunks = []
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+
     def _receive_messages(self):
         print("[Peer %s] Waiting for ordered operations from sequencer..." % self.myself)
+        self.sock.settimeout(0.5)
+
         while not self.finished:
-            raw = self.sock.recv(4096)
+            try:
+                raw = self.sock.recv(4096)
+            except SocketTimeout:
+                self._request_missing_sequence(self.next_expected_seq)
+                self._process_buffer()
+                continue
+
             msg = pickle.loads(raw)
 
             if isinstance(msg, dict) and msg.get("op") == "apply":
-                seq = msg["seq"]
-                self.buffer[seq] = msg
-                print("[Peer %s] Buffered seq=%s (%s from peer %s)" % (
-                    self.myself,
-                    seq,
-                    msg["kind"],
-                    msg["from"],
-                ))
+                self._buffer_ordered_message(msg)
                 self._process_buffer()
             else:
                 print("[Peer %s] Ignored unexpected UDP message: %s" % (self.myself, msg))
@@ -394,13 +457,15 @@ class PeerCommunicator:
                 ]
 
                 expected_handshakes = len(self.peers)
-                total_expected_messages = (len(self.peers) * self.n_ops) + 1
+                total_expected_messages = (self.expected_peers * self.n_ops) + 1
+                server_endpoint = self._get_server_endpoint()
 
                 self.msg_handler = MessageHandler(
                     self.recv_socket,
                     self.myself,
                     expected_handshakes,
                     total_expected_messages,
+                    server_endpoint,
                 )
                 self.msg_handler.start()
                 print("[Peer %s] Receiver thread started." % self.myself)

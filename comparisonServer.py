@@ -34,6 +34,11 @@ class ComparisonServer:
         self.sequence_number = 0
         self.peer_list = []
 
+        # Log mantido pelo sequenciador: permite retransmitir mensagens
+        # quando uma réplica detecta lacuna na sequência recebida por UDP.
+        self.ordered_log = {}
+        self.last_local_seq_by_peer = {}
+
     def close(self):
         try:
             self.naming_client.unbind(SERVER_NAME)
@@ -146,6 +151,77 @@ class ComparisonServer:
             host, port = split_endpoint(peer["endereco"])
             self.udp_sock.sendto(data, (host, port))
 
+    def _recv_request(self, conn):
+        data = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        if not data:
+            return None
+
+        return pickle.loads(data)
+
+    def _handle_resend_request(self, req):
+        seq = req.get("seq")
+        if not isinstance(seq, int):
+            return {"status": "erro", "mensagem": "Sequência inválida."}
+
+        msg = self.ordered_log.get(seq)
+        if msg is None:
+            return {"status": "unavailable", "seq": seq}
+
+        return {"status": "ok", "message": msg}
+
+    def _validate_submit_order(self, req):
+        peer_id = req["from"]
+        local_seq = req["local_seq"]
+        expected_local_seq = self.last_local_seq_by_peer.get(peer_id, 0) + 1
+
+        if local_seq != expected_local_seq:
+            return {
+                "status": "erro",
+                "mensagem": (
+                    "Ordem local inválida para peer %s: esperado local_seq=%s, recebido local_seq=%s"
+                    % (peer_id, expected_local_seq, local_seq)
+                ),
+            }
+
+        self.last_local_seq_by_peer[peer_id] = local_seq
+        return None
+
+    def _handle_submit(self, req):
+        order_error = self._validate_submit_order(req)
+        if order_error is not None:
+            return order_error, False
+
+        self.sequence_number += 1
+
+        ordered_msg = {
+            "op": "apply",
+            "seq": self.sequence_number,
+            "kind": req["kind"],
+            "from": req["from"],
+            "local_seq": req["local_seq"],
+            "key": req["key"],
+            "value": req.get("value"),
+        }
+
+        self.ordered_log[self.sequence_number] = ordered_msg
+
+        print(
+            f"[Server] seq={self.sequence_number} | "
+            f"peer={req['from']} | local_seq={req['local_seq']} | "
+            f"{req['kind']} {req['key']}"
+            + (f"={req.get('value')}" if req["kind"] == "WRITE" else "")
+        )
+
+        self._broadcast(ordered_msg)
+
+        return {"status": "ok", "seq": self.sequence_number}, True
+
     def receive_and_sequence_submissions(self, expected_total):
         print(f"[Server] Waiting for {expected_total} submitted operations...")
 
@@ -153,43 +229,17 @@ class ComparisonServer:
         while received < expected_total:
             conn, _ = self.server_sock.accept()
             try:
-                data = b""
-                while True:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
+                req = self._recv_request(conn)
 
-                req = pickle.loads(data)
+                if isinstance(req, dict) and req.get("op") == "submit":
+                    response, accepted = self._handle_submit(req)
+                    conn.sendall(pickle.dumps(response))
+                    if accepted:
+                        received += 1
 
-                if req.get("op") == "submit":
-                    self.sequence_number += 1
+                elif isinstance(req, dict) and req.get("op") == "resend":
+                    conn.sendall(pickle.dumps(self._handle_resend_request(req)))
 
-                    ordered_msg = {
-                        "op": "apply",
-                        "seq": self.sequence_number,
-                        "kind": req["kind"],
-                        "from": req["from"],
-                        "local_seq": req["local_seq"],
-                        "key": req["key"],
-                        "value": req.get("value"),
-                    }
-
-                    print(
-                        f"[Server] seq={self.sequence_number} | "
-                        f"peer={req['from']} | local_seq={req['local_seq']} | "
-                        f"{req['kind']} {req['key']}"
-                        + (f"={req.get('value')}" if req["kind"] == "WRITE" else "")
-                    )
-
-                    self._broadcast(ordered_msg)
-
-                    conn.sendall(pickle.dumps({
-                        "status": "ok",
-                        "seq": self.sequence_number
-                    }))
-
-                    received += 1
                 else:
                     conn.sendall(pickle.dumps({"status": "ignored"}))
             finally:
@@ -206,6 +256,7 @@ class ComparisonServer:
             "key": None,
             "value": None,
         }
+        self.ordered_log[self.sequence_number] = end_msg
         print(f"[Server] Broadcasting END marker as seq={self.sequence_number}")
         self._broadcast(end_msg)
 
@@ -216,21 +267,19 @@ class ComparisonServer:
         while len(states) < expected_count:
             conn, _ = self.server_sock.accept()
             try:
-                data = b""
-                while True:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
+                req = self._recv_request(conn)
 
-                state = pickle.loads(data)
-                if state.get("op") == "final_state":
-                    states.append(state)
+                if isinstance(req, dict) and req.get("op") == "final_state":
+                    states.append(req)
                     print(
-                        f"[Server] Received final state from peer {state['peer']} "
-                        f"with {len(state['db'])} records"
+                        f"[Server] Received final state from peer {req['peer']} "
+                        f"with {len(req['db'])} records"
                     )
                     conn.sendall(pickle.dumps({"status": "received"}))
+
+                elif isinstance(req, dict) and req.get("op") == "resend":
+                    conn.sendall(pickle.dumps(self._handle_resend_request(req)))
+
                 else:
                     conn.sendall(pickle.dumps({"status": "ignored"}))
             finally:
@@ -291,6 +340,8 @@ class ComparisonServer:
                 print("[Server] Peers started. Sequencing commands now...")
 
                 self.sequence_number = 0
+                self.ordered_log = {}
+                self.last_local_seq_by_peer = {}
 
                 self.receive_and_sequence_submissions(expected_total)
                 self.broadcast_end_marker()
