@@ -50,6 +50,9 @@ def compose_endpoint(host: str, port: int) -> str:
 
 
 def detect_local_ip(remote_host: str = SERVICE_NAMES_ADDR, remote_port: int = SERVICE_NAMES_TCP_PORT) -> str:
+    if ADVERTISE_ADDR:
+        return ADVERTISE_ADDR
+
     with socket(AF_INET, SOCK_DGRAM) as sock:
         try:
             sock.connect((remote_host, remote_port))
