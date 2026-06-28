@@ -2,7 +2,7 @@ from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, s
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
-from constMP import SERVICE_NAMES_ADDR, SERVICE_NAMES_TCP_PORT
+from constMP import SERVICE_NAMES_ADDR, SERVICE_NAMES_TCP_PORT, ADVERTISE_ADDR
 
 
 def _read_all(sock) -> bytes:
