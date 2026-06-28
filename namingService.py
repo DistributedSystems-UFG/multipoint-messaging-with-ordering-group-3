@@ -1,8 +1,9 @@
 from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, socket
 import pickle
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-from constMP import SERVICE_NAMES_ADDR, SERVICE_NAMES_TCP_PORT, ADVERTISE_ADDR
+from constMP import BIND_ADDR, SERVICE_NAMES_ADDR, SERVICE_NAMES_TCP_PORT
 
 
 def _read_all(sock) -> bytes:
@@ -49,9 +50,54 @@ def compose_endpoint(host: str, port: int) -> str:
     return "%s:%d" % (host, port)
 
 
+def _get_ec2_public_ipv4(timeout: float = 1.0) -> Optional[str]:
+    """
+    Descobre automaticamente o IPv4 público quando o processo está rodando em EC2.
+    Não configura endereço de peer/servidor manualmente; apenas lê o endereço da própria instância.
+    """
+    token = None
+
+    try:
+        token_request = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(token_request, timeout=timeout) as response:
+            token = response.read().decode("utf-8").strip()
+    except Exception:
+        token = None
+
+    urls = [
+        "http://169.254.169.254/latest/meta-data/public-ipv4",
+    ]
+
+    for url in urls:
+        try:
+            headers = {}
+            if token:
+                headers["X-aws-ec2-metadata-token"] = token
+            ip_request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(ip_request, timeout=timeout) as response:
+                public_ip = response.read().decode("utf-8").strip()
+            if public_ip:
+                return public_ip
+        except Exception:
+            continue
+
+    return None
+
+
 def detect_local_ip(remote_host: str = SERVICE_NAMES_ADDR, remote_port: int = SERVICE_NAMES_TCP_PORT) -> str:
-    if ADVERTISE_ADDR:
-        return ADVERTISE_ADDR
+    """
+    Endereço que será registrado no Serviço de Nomes.
+
+    Em EC2, registra o IPv4 público da própria instância, permitindo comunicação entre regiões.
+    Fora da EC2, usa um fallback local para execução em uma LAN ou na mesma máquina.
+    """
+    public_ip = _get_ec2_public_ipv4()
+    if public_ip:
+        return public_ip
 
     with socket(AF_INET, SOCK_DGRAM) as sock:
         try:
@@ -137,7 +183,7 @@ class NamingServiceClient(object):
 
 
 class NamingServiceServer(object):
-    def __init__(self, bind_host: str = "0.0.0.0", port: int = SERVICE_NAMES_TCP_PORT):
+    def __init__(self, bind_host: str = BIND_ADDR, port: int = SERVICE_NAMES_TCP_PORT):
         self.bind_host = bind_host
         self.port = port
         self.records = {}  # type: Dict[str, NamingRecord]
@@ -155,8 +201,6 @@ class NamingServiceServer(object):
             return {"status": "erro", "mensagem": "Nome inválido."}
         if not isinstance(address, str) or not address.strip():
             return {"status": "erro", "mensagem": "Endereço inválido."}
-        if name in self.records:
-            return {"status": "erro", "mensagem": "O nome %r já está registrado." % name}
 
         self.records[name] = NamingRecord(name=name, address=address)
         return {"status": "ok"}

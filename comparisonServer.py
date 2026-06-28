@@ -2,7 +2,7 @@ from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, s
 import pickle
 import time
 
-from constMP import PEER_TYPE, SERVER_NAME, SERVER_PORT, SERVER_TYPE
+from constMP import BIND_ADDR, MIN_PEERS, PEER_TYPE, SERVER_NAME, SERVER_PORT, SERVER_TYPE
 from namingService import NamingServiceClient, compose_endpoint, detect_local_ip, split_endpoint
 
 
@@ -23,19 +23,19 @@ class ComparisonServer:
 
         self.server_sock = socket(AF_INET, SOCK_STREAM)
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", SERVER_PORT))
-        self.server_sock.listen(16)
+        self.server_sock.bind((BIND_ADDR, SERVER_PORT))
+        self.server_sock.listen(32)
 
         self.endpoint = compose_endpoint(self.local_ip, SERVER_PORT)
         self.naming_client.bind(SERVER_NAME, self.endpoint)
         self.naming_client.register(SERVER_NAME, SERVER_TYPE)
+        print("[Server] Registered %s at %s" % (SERVER_NAME, self.endpoint))
 
         self.udp_sock = socket(AF_INET, SOCK_DGRAM)
         self.sequence_number = 0
         self.peer_list = []
 
-        # Log mantido pelo sequenciador: permite retransmitir mensagens
-        # quando uma réplica detecta lacuna na sequência recebida por UDP.
+        # Log do sequenciador. Usado para retransmitir mensagens UDP perdidas.
         self.ordered_log = {}
         self.last_local_seq_by_peer = {}
 
@@ -57,36 +57,41 @@ class ComparisonServer:
 
     def _discover_peers(self):
         peers = self.naming_client.discover(PEER_TYPE)
-        peers = sorted(peers, key=lambda item: item["nome"])
-        return peers
+        return sorted(peers, key=lambda item: item["nome"])
 
     def get_peer_list(self, wait=True, poll_interval=1.0):
         while True:
             peers = self._discover_peers()
-            if peers or not wait:
+
+            if not wait:
                 self.peer_list = peers
                 print("[Server] Discovered peers:", peers)
                 return peers
 
-            print("[Server] No peers discovered yet. Waiting for registrations...")
+            if len(peers) >= MIN_PEERS:
+                self.peer_list = peers
+                print("[Server] Discovered peers:", peers)
+                return peers
+
+            print("[Server] Waiting for peers... %d/%d" % (len(peers), MIN_PEERS))
             time.sleep(poll_interval)
 
     def _send_control(self, peer, payload, expect_response=True, timeout=5.0):
         host, port = split_endpoint(peer["endereco"])
 
-        with socket(AF_INET, SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect((host, port))
-            sock.sendall(pickle.dumps(payload))
-            sock.shutdown(1)
+        try:
+            with socket(AF_INET, SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                sock.sendall(pickle.dumps(payload))
+                sock.shutdown(1)
 
-            if not expect_response:
-                return None
+                if not expect_response:
+                    return None
 
-            try:
                 raw = _read_all(sock)
-            except Exception:
-                return None
+        except Exception:
+            return None
 
         if not raw:
             return None
@@ -102,31 +107,58 @@ class ComparisonServer:
         return response
 
     def prepare_peers(self, peer_list, n_ops):
-        print(f"[Server] Preparing {len(peer_list)} peers for {n_ops} operations each...")
+        print("[Server] Preparing discovered peers for %s operations each..." % n_ops)
         ready_peers = []
 
-        for idx, peer in enumerate(peer_list):
+        for peer in peer_list:
+            peer_id = len(ready_peers)
             payload = {
                 "op": "control",
                 "phase": "prepare",
-                "peer_id": idx,
+                "peer_id": peer_id,
                 "n_ops": n_ops,
-                "expected_peers": len(peer_list),
-                "peers": peer_list,
+                "expected_peers": MIN_PEERS,
+                "peers": None,  # preenchido depois que sabemos quais peers estão ativos
             }
 
             response = self._send_control(peer, payload, expect_response=True, timeout=5.0)
 
             if response and response.get("status") == "ok":
                 ready_peers.append(peer)
-                print(f"[Server] Prepared {peer['nome']} at {peer['endereco']}")
+                print("[Server] Prepared %s at %s" % (peer["nome"], peer["endereco"]))
             else:
-                print(f"[Server] Failed to prepare {peer['nome']} at {peer['endereco']}")
+                print("[Server] Ignored unreachable peer %s at %s" % (peer["nome"], peer["endereco"]))
 
-        return ready_peers
+            if len(ready_peers) == MIN_PEERS:
+                break
+
+        if len(ready_peers) < MIN_PEERS:
+            print("[Server] Only %d/%d active peers are ready." % (len(ready_peers), MIN_PEERS))
+            return []
+
+        # Envia uma segunda preparação apenas para os peers ativos, agora com a lista final.
+        final_ready = []
+        for idx, peer in enumerate(ready_peers):
+            payload = {
+                "op": "control",
+                "phase": "prepare",
+                "peer_id": idx,
+                "n_ops": n_ops,
+                "expected_peers": MIN_PEERS,
+                "peers": ready_peers,
+            }
+            response = self._send_control(peer, payload, expect_response=True, timeout=5.0)
+            if response and response.get("status") == "ok":
+                final_ready.append(peer)
+
+        if len(final_ready) != MIN_PEERS:
+            print("[Server] Could not finalize preparation of all peers. Retrying next round.")
+            return []
+
+        return final_ready
 
     def release_peers(self, peer_list):
-        print(f"[Server] Releasing {len(peer_list)} peers to start together...")
+        print("[Server] Releasing %d peers to start together..." % len(peer_list))
         for peer in peer_list:
             self._send_control(
                 peer,
@@ -136,7 +168,7 @@ class ComparisonServer:
             )
 
     def stop_peers(self, peer_list):
-        print(f"[Server] Sending stop signal to {len(peer_list)} peers...")
+        print("[Server] Sending stop signal to %d peers..." % len(peer_list))
         for peer in peer_list:
             self._send_control(
                 peer,
@@ -212,10 +244,15 @@ class ComparisonServer:
         self.ordered_log[self.sequence_number] = ordered_msg
 
         print(
-            f"[Server] seq={self.sequence_number} | "
-            f"peer={req['from']} | local_seq={req['local_seq']} | "
-            f"{req['kind']} {req['key']}"
-            + (f"={req.get('value')}" if req["kind"] == "WRITE" else "")
+            "[Server] seq=%s | peer=%s | local_seq=%s | %s %s%s"
+            % (
+                self.sequence_number,
+                req["from"],
+                req["local_seq"],
+                req["kind"],
+                req["key"],
+                ("=%s" % req.get("value")) if req["kind"] == "WRITE" else "",
+            )
         )
 
         self._broadcast(ordered_msg)
@@ -223,7 +260,7 @@ class ComparisonServer:
         return {"status": "ok", "seq": self.sequence_number}, True
 
     def receive_and_sequence_submissions(self, expected_total):
-        print(f"[Server] Waiting for {expected_total} submitted operations...")
+        print("[Server] Waiting for %d submitted operations..." % expected_total)
 
         received = 0
         while received < expected_total:
@@ -257,12 +294,12 @@ class ComparisonServer:
             "value": None,
         }
         self.ordered_log[self.sequence_number] = end_msg
-        print(f"[Server] Broadcasting END marker as seq={self.sequence_number}")
+        print("[Server] Broadcasting END marker as seq=%s" % self.sequence_number)
         self._broadcast(end_msg)
 
     def collect_final_states(self, expected_count):
         states = []
-        print(f"[Server] Waiting for final states from {expected_count} peers...")
+        print("[Server] Waiting for final states from %d peers..." % expected_count)
 
         while len(states) < expected_count:
             conn, _ = self.server_sock.accept()
@@ -272,8 +309,8 @@ class ComparisonServer:
                 if isinstance(req, dict) and req.get("op") == "final_state":
                     states.append(req)
                     print(
-                        f"[Server] Received final state from peer {req['peer']} "
-                        f"with {len(req['db'])} records"
+                        "[Server] Received final state from peer %s with %d records and %d log entries"
+                        % (req["peer"], len(req["db"]), len(req["log"]))
                     )
                     conn.sendall(pickle.dumps({"status": "received"}))
 
@@ -292,20 +329,26 @@ class ComparisonServer:
             print("[Server] No final states received.")
             return
 
-        reference = states[0]["db"]
+        states = sorted(states, key=lambda state: state["peer"])
+        reference_db = states[0]["db"]
+        reference_log = states[0]["log"]
         ok = True
 
         for state in states[1:]:
-            if state["db"] != reference:
+            if state["db"] != reference_db:
                 ok = False
-                print(f"[Server] Replica mismatch detected on peer {state['peer']}")
+                print("[Server] Replica DB mismatch detected on peer %s" % state["peer"])
+
+            if state["log"] != reference_log:
+                ok = False
+                print("[Server] Operation-order log mismatch detected on peer %s" % state["peer"])
 
         if ok:
-            print("[Server] All replicas ended with the same database content.")
+            print("[Server] CONSISTENCY OK: same final DB and same total operation order on all replicas.")
         else:
-            print("[Server] Final replica contents:")
+            print("[Server] CONSISTENCY VIOLATION detected.")
             for state in states:
-                print(f"  peer={state['peer']} db={state['db']}")
+                print("  peer=%s db_records=%d log_entries=%d" % (state["peer"], len(state["db"]), len(state["log"])))
 
     @staticmethod
     def prompt_user():
@@ -324,19 +367,16 @@ class ComparisonServer:
                     break
 
                 peer_list = self.get_peer_list(wait=True)
-                if not peer_list:
-                    continue
-
                 ready_peers = self.prepare_peers(peer_list, n_ops)
-                if not ready_peers:
-                    print("[Server] No peers confirmed readiness. Waiting for the next round...")
+                if len(ready_peers) < MIN_PEERS:
+                    print("[Server] Not enough active peers. Waiting for the next attempt...")
                     time.sleep(1.0)
                     continue
 
                 self.peer_list = ready_peers
                 self.release_peers(ready_peers)
 
-                expected_total = len(ready_peers) * n_ops
+                expected_total = MIN_PEERS * n_ops
                 print("[Server] Peers started. Sequencing commands now...")
 
                 self.sequence_number = 0
@@ -346,7 +386,7 @@ class ComparisonServer:
                 self.receive_and_sequence_submissions(expected_total)
                 self.broadcast_end_marker()
 
-                states = self.collect_final_states(len(ready_peers))
+                states = self.collect_final_states(MIN_PEERS)
                 self.compare_final_states(states)
         finally:
             self.close()

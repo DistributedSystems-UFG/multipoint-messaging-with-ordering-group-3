@@ -5,7 +5,7 @@ import random
 import threading
 import time
 
-from constMP import DB_FILE_PREFIX, PEER_TCP_PORT, PEER_UDP_PORT, PEER_TYPE, SERVER_NAME
+from constMP import BIND_ADDR, DB_FILE_PREFIX, PEER_TCP_PORT, PEER_UDP_PORT, PEER_TYPE, SERVER_NAME
 from namingService import NamingServiceClient, compose_endpoint, detect_local_ip, split_endpoint
 
 
@@ -37,7 +37,7 @@ class MessageHandler(threading.Thread):
         self.next_expected_seq = 1
         self.finished = False
 
-        self._load_or_create_db()
+        self._reset_db()
 
     def increment_handshake(self):
         with self._lock:
@@ -47,28 +47,13 @@ class MessageHandler(threading.Thread):
         with self._lock:
             return self.handshake_count
 
-    def _load_or_create_db(self):
-        if os.path.exists(self.db_file):
-            self._load_db()
-        else:
-            self.db = {
-                "registro_%d" % i: "valor_inicial_%d" % i
-                for i in range(1, 101)
-            }
-            self._save_db()
-            print("[Peer %s] Created initial DB with 100 entries in %s" % (self.myself, self.db_file))
-
-    def _load_db(self):
-        self.db = {}
-        with open(self.db_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if ";" in line:
-                    key, value = line.split(";", 1)
-                    self.db[key] = value
-        print("[Peer %s] Loaded DB from %s with %d entries" % (self.myself, self.db_file, len(self.db)))
+    def _reset_db(self):
+        self.db = {
+            "registro_%d" % i: "valor_inicial_%d" % i
+            for i in range(1, 101)
+        }
+        self._save_db()
+        print("[Peer %s] Reset initial DB with 100 entries in %s" % (self.myself, self.db_file))
 
     def _save_db(self):
         with open(self.db_file, "w", encoding="utf-8") as f:
@@ -106,8 +91,18 @@ class MessageHandler(threading.Thread):
         seq = msg["seq"]
         kind = msg["kind"]
         origin = msg["from"]
+        local_seq = msg.get("local_seq")
         key = msg["key"]
         value = msg.get("value")
+
+        entry = {
+            "seq": seq,
+            "kind": kind,
+            "from": origin,
+            "local_seq": local_seq,
+            "key": key,
+            "value": value,
+        }
 
         if kind == "WRITE":
             self._apply_write(key, value)
@@ -120,6 +115,7 @@ class MessageHandler(threading.Thread):
             )
         elif kind == "READ":
             current = self._apply_read(key)
+            entry["result"] = current
             text = "[Peer %s] Applied seq=%s from peer %s: READ %s -> %s" % (
                 self.myself,
                 seq,
@@ -134,7 +130,7 @@ class MessageHandler(threading.Thread):
             text = "[Peer %s] Applied seq=%s: unknown kind=%s" % (self.myself, seq, kind)
 
         print(text)
-        self.applied_log.append(text)
+        self.applied_log.append(entry)
 
     def _process_buffer(self):
         while self.next_expected_seq in self.buffer:
@@ -158,12 +154,10 @@ class MessageHandler(threading.Thread):
 
         if seq not in self.buffer:
             self.buffer[seq] = msg
-            print("[Peer %s] Buffered seq=%s (%s from peer %s)" % (
-                self.myself,
-                seq,
-                msg["kind"],
-                msg["from"],
-            ))
+            print(
+                "[Peer %s] Buffered seq=%s (%s from peer %s)"
+                % (self.myself, seq, msg["kind"], msg["from"])
+            )
 
     def _request_missing_sequence(self, seq):
         server_host, server_port = self.server_endpoint
@@ -175,7 +169,10 @@ class MessageHandler(threading.Thread):
                 sock.connect((server_host, server_port))
                 sock.sendall(pickle.dumps(req))
                 sock.shutdown(1)
-                response = pickle.loads(self._read_all(sock))
+                response_raw = self._read_all(sock)
+                if not response_raw:
+                    return
+                response = pickle.loads(response_raw)
         except Exception as exc:
             print("[Peer %s] Could not request seq=%s: %s" % (self.myself, seq, exc))
             return
@@ -220,11 +217,25 @@ class MessageHandler(threading.Thread):
             else:
                 print("[Peer %s] Ignored unexpected UDP message: %s" % (self.myself, msg))
 
+    @staticmethod
+    def _format_log_entry(entry):
+        if entry["kind"] == "WRITE":
+            return "seq=%s peer=%s local_seq=%s WRITE %s=%s" % (
+                entry["seq"], entry["from"], entry["local_seq"], entry["key"], entry["value"]
+            )
+        if entry["kind"] == "READ":
+            return "seq=%s peer=%s local_seq=%s READ %s -> %s" % (
+                entry["seq"], entry["from"], entry["local_seq"], entry["key"], entry.get("result")
+            )
+        if entry["kind"] == "END":
+            return "seq=%s END" % entry["seq"]
+        return str(entry)
+
     def _write_log_file(self):
         filename = "logfile%s.log" % self.myself
         with open(filename, "w", encoding="utf-8") as f:
-            for line in self.applied_log:
-                f.write(line + "\n")
+            for entry in self.applied_log:
+                f.write(self._format_log_entry(entry) + "\n")
 
     def get_snapshot(self):
         return {
@@ -257,12 +268,12 @@ class PeerCommunicator:
 
         self.recv_socket = socket(AF_INET, SOCK_DGRAM)
         self.recv_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.recv_socket.bind(("0.0.0.0", PEER_UDP_PORT))
+        self.recv_socket.bind((BIND_ADDR, PEER_UDP_PORT))
 
         self.tcp_server_sock = socket(AF_INET, SOCK_STREAM)
         self.tcp_server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.tcp_server_sock.bind(("0.0.0.0", PEER_TCP_PORT))
-        self.tcp_server_sock.listen(1)
+        self.tcp_server_sock.bind((BIND_ADDR, PEER_TCP_PORT))
+        self.tcp_server_sock.listen(8)
 
     @staticmethod
     def _read_all(sock):
@@ -284,12 +295,17 @@ class PeerCommunicator:
         endpoint = self.naming_client.lookup(SERVER_NAME)
         return split_endpoint(endpoint)
 
+    def _read_control_message(self, conn):
+        raw = self._read_all(conn)
+        if not raw:
+            return None
+        return pickle.loads(raw)
+
     def _wait_for_control(self, expected_phase):
         while True:
             conn, _ = self.tcp_server_sock.accept()
             try:
-                raw = conn.recv(4096)
-                msg = pickle.loads(raw)
+                msg = self._read_control_message(conn)
 
                 if isinstance(msg, dict) and msg.get("op") == "control":
                     phase = msg.get("phase")
@@ -307,14 +323,20 @@ class PeerCommunicator:
                 conn.close()
 
     def _load_round_configuration(self):
-        prepare_msg = self._wait_for_control("prepare")
-        if prepare_msg.get("phase") == "stop":
-            return None
+        while True:
+            prepare_msg = self._wait_for_control("prepare")
+            if prepare_msg.get("phase") == "stop":
+                return None
 
-        self.myself = int(prepare_msg["peer_id"])
-        self.n_ops = int(prepare_msg["n_ops"])
-        self.expected_peers = int(prepare_msg["expected_peers"])
-        self.current_round_peers = prepare_msg["peers"]
+            if prepare_msg.get("peers") is None:
+                # Primeira chamada do servidor: serve apenas para testar se este peer está ativo.
+                continue
+
+            self.myself = int(prepare_msg["peer_id"])
+            self.n_ops = int(prepare_msg["n_ops"])
+            self.expected_peers = int(prepare_msg["expected_peers"])
+            self.current_round_peers = prepare_msg["peers"]
+            break
 
         print(
             "[Peer %s] Prepared for round with %s operations per peer and %s total peers."
