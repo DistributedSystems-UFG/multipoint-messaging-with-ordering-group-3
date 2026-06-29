@@ -3,7 +3,7 @@
 # ÚNICO endereço configurado manualmente no sistema:
 # troque pelo IPv4 público da EC2 onde o namingService.py está rodando.
 # Exemplo: SERVICE_NAMES_ADDR = "54.123.45.67"
-SERVICE_NAMES_ADDR = "44.203.222.64"
+SERVICE_NAMES_ADDR = "3.236.200.153"
 SERVICE_NAMES_TCP_PORT = 5678
 
 # Endereço usado pelos processos para escutar conexões na própria máquina.
